@@ -1,0 +1,17 @@
+{
+  "name": "gta-contract-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for GTA contract management",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

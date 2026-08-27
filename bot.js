@@ -126,6 +126,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isButton()) {
       if (interaction.customId === 'btn_submit_contract')          return await handleFinalSubmit(interaction);
+      if (interaction.customId === 'btn_new_contract')            return await handleStart(interaction);
       if (interaction.customId.startsWith('btn_approve_'))         return await handleApprove(interaction);
       if (interaction.customId.startsWith('btn_reject_'))          return await handleReject(interaction);
     }
@@ -148,10 +149,10 @@ client.on('interactionCreate', async (interaction) => {
 // ─── Step 1: Choose contract ──────────────────────────────────────
 async function handleStart(interaction) {
   if (CHANNEL_CONTRACTS && interaction.channelId !== CHANNEL_CONTRACTS) {
-    return interaction.reply({
-      content: `❌ Команду можна використовувати тільки в <#${CHANNEL_CONTRACTS}>`,
-      ephemeral: true
-    });
+    const errMsg = { content: `❌ Команду можна використовувати тільки в <#${CHANNEL_CONTRACTS}>`, ephemeral: true };
+    return interaction.isButton()
+      ? interaction.reply(errMsg)
+      : interaction.reply(errMsg);
   }
 
   formState.set(interaction.user.id, { userId: interaction.user.id, step: 'contract' });
@@ -174,7 +175,14 @@ async function handleStart(interaction) {
     .setColor(0x2b2d31)
     .setFooter({ text: 'Kaneko Family' });
 
-  await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+  const payload = { embeds: [embed], components: [row], ephemeral: true };
+
+  // Button interactions need update() or reply(), slash commands need reply()
+  if (interaction.isButton()) {
+    await interaction.update(payload);
+  } else {
+    await interaction.reply(payload);
+  }
 }
 
 // ─── Step 2: Choose members ───────────────────────────────────────
@@ -355,11 +363,18 @@ async function handleFinalSubmit(interaction) {
 
   const confirmEmbed = new EmbedBuilder()
     .setTitle('✅ Заявку відправлено!')
-    .setDescription('Контракт відправлено на перевірку. Після підтвердження виплата з\'явиться у відповідному каналі.')
+    .setDescription('Контракт відправлено на перевірку. Після підтвердження виплата з\'явиться у відповідному каналі.\n\n➕ Для створення нового контракту натисни кнопку нижче')
     .setColor(0x57f287)
     .setFooter({ text: 'Kaneko Family' });
 
-  await interaction.editReply({ embeds: [confirmEmbed], components: [] });
+  const newContractRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('btn_new_contract')
+      .setLabel('📋 Новий контракт')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  await interaction.editReply({ embeds: [confirmEmbed], components: [newContractRow] });
 
   // Delete the bot's payout message from the channel after a short delay
   setTimeout(async () => {
@@ -371,51 +386,51 @@ async function handleFinalSubmit(interaction) {
 
 // ─── Approve ──────────────────────────────────────────────────────
 async function handleApprove(interaction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferUpdate();
 
-  const originalEmbed = interaction.message.embeds[0];
+  try {
+    const originalEmbed = interaction.message.embeds[0];
+    const imageUrl = originalEmbed.image?.url ?? null;
 
-  // Filter out the old timestamp field, add new one
-  const fields = originalEmbed.fields
-    .filter(f => f.name !== '🕐 Час подання')
-    .concat({ name: '🕐 Затверджено', value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }) });
+    const payoutFields = originalEmbed.fields
+      .filter(f => f.name !== '🕐 Час подання')
+      .concat([{ name: '🕐 Затверджено', value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }), inline: false }]);
 
-  const approvedEmbed = new EmbedBuilder()
-    .setTitle('💰 Виплата затверджена')
-    .setDescription(`✅ Перевірив: <@${interaction.user.id}>`)
-    .addFields(fields)
-    .setColor(0x57f287)
-    .setFooter({ text: 'Kaneko Family' });
+    const approvedEmbed = new EmbedBuilder()
+      .setTitle('💰 Виплата затверджена')
+      .setDescription(`✅ Перевірив: <@${interaction.user.id}>`)
+      .addFields(payoutFields)
+      .setColor(0x57f287)
+      .setFooter({ text: 'Kaneko Family' });
 
-  // Set image only if it exists
-  if (originalEmbed.image?.url) {
-    approvedEmbed.setImage(originalEmbed.image.url);
+    if (imageUrl) approvedEmbed.setImage(imageUrl);
+
+    const payoutsChannel = CHANNEL_PAYOUTS
+      ? interaction.guild.channels.cache.get(CHANNEL_PAYOUTS)
+      : null;
+    if (payoutsChannel) {
+      await payoutsChannel.send({ embeds: [approvedEmbed] });
+    }
+
+    const updatedEmbed = new EmbedBuilder()
+      .setTitle('📑 Контракт ✅ ЗАТВЕРДЖЕНО')
+      .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
+      .addFields(originalEmbed.fields)
+      .setColor(0x57f287)
+      .setFooter({ text: originalEmbed.footer?.text ?? 'Kaneko Family' });
+
+    if (imageUrl) updatedEmbed.setImage(imageUrl);
+
+    await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
+
+  } catch (err) {
+    console.error('Approve error:', err);
   }
-
-  const payoutsChannel = CHANNEL_PAYOUTS ? interaction.guild.channels.cache.get(CHANNEL_PAYOUTS) : null;
-  if (payoutsChannel) {
-    await payoutsChannel.send({ embeds: [approvedEmbed] });
-  }
-
-  // Update the review message
-  const updatedEmbed = new EmbedBuilder()
-    .setTitle('📑 Контракт ✅ ЗАТВЕРДЖЕНО')
-    .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
-    .addFields(originalEmbed.fields)
-    .setColor(0x57f287)
-    .setFooter(originalEmbed.footer ?? { text: 'Kaneko Family' });
-
-  if (originalEmbed.image?.url) {
-    updatedEmbed.setImage(originalEmbed.image.url);
-  }
-
-  await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
-  await interaction.editReply({ content: '✅ Контракт затверджено і виплату відправлено!' });
 }
 
 // ─── Reject ───────────────────────────────────────────────────────
 async function handleReject(interaction) {
-  const submitterId = interaction.customId.split('_')[2];
+  const submitterId = interaction.customId.replace('btn_reject_', '');
 
   const modal = new ModalBuilder()
     .setCustomId(`modal_reject_${submitterId}`)
@@ -435,31 +450,39 @@ async function handleReject(interaction) {
 }
 
 async function handleRejectModal(interaction) {
-  await interaction.deferReply({ ephemeral: true });
-
-  const submitterId = interaction.customId.split('_')[2];
-  const reason = interaction.fields.getTextInputValue('reject_reason');
-  const originalEmbed = interaction.message.embeds[0];
-
-  const rejectedEmbed = EmbedBuilder.from(originalEmbed)
-    .setTitle('📑 Контракт ❌ ВІДХИЛЕНО')
-    .setColor(0xed4245)
-    .setDescription(`${originalEmbed.description}\n\n❌ Відхилив: <@${interaction.user.id}>\n📝 Причина: ${reason}`);
-
-  await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
+  await interaction.deferUpdate();
 
   try {
-    const submitter = await interaction.guild.members.fetch(submitterId);
-    await submitter.send({
-      embeds: [new EmbedBuilder()
-        .setTitle('❌ Ваш контракт відхилено')
-        .setDescription(`**Причина:** ${reason}`)
-        .setColor(0xed4245)
-        .setFooter({ text: 'Kaneko Family' })]
-    });
-  } catch {}
+    const submitterId = interaction.customId.replace('modal_reject_', '');
+    const reason = interaction.fields.getTextInputValue('reject_reason');
+    const originalEmbed = interaction.message.embeds[0];
+    const imageUrl = originalEmbed.image?.url ?? null;
 
-  await interaction.editReply({ content: '❌ Контракт відхилено.' });
+    const rejectedEmbed = new EmbedBuilder()
+      .setTitle('📑 Контракт ❌ ВІДХИЛЕНО')
+      .setDescription(`${originalEmbed.description ?? ''}\n\n❌ Відхилив: <@${interaction.user.id}>\n📝 Причина: ${reason}`)
+      .addFields(originalEmbed.fields)
+      .setColor(0xed4245)
+      .setFooter({ text: originalEmbed.footer?.text ?? 'Kaneko Family' });
+
+    if (imageUrl) rejectedEmbed.setImage(imageUrl);
+
+    await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
+
+    try {
+      const submitter = await interaction.guild.members.fetch(submitterId);
+      await submitter.send({
+        embeds: [new EmbedBuilder()
+          .setTitle('❌ Ваш контракт відхилено')
+          .setDescription(`**Причина:** ${reason}`)
+          .setColor(0xed4245)
+          .setFooter({ text: 'Kaneko Family' })]
+      });
+    } catch {}
+
+  } catch (err) {
+    console.error('Reject modal error:', err);
+  }
 }
 
 // ─── Setup channels ───────────────────────────────────────────────

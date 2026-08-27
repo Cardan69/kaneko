@@ -24,8 +24,8 @@ const CONTRACTS = [
   { id: 'trophy1',  name: 'Продажа трофеїв І',      amount: 90000  },
   { id: 'master2',  name: 'Майстер на всі руки ІІ', amount: 230000 },
   { id: 'trophy3',  name: 'Продажа трофеїв ІІІ',    amount: 190000 },
-  { id: 'balloon2', name: 'Балонний транзит ІІ',     amount: 185000 },
-  { id: 'root2',    name: 'Під корінь ІІ',           amount: 175000 },
+  { id: 'balloon2', name: 'Балонний транзит ІІ',    amount: 185000 },
+  { id: 'root2',    name: 'Під корінь ІІ',          amount: 175000 },
 ];
 
 function env(name) {
@@ -53,7 +53,7 @@ const formState = new Map();
 // messageId currently being approved/rejected (prevents double payout)
 const inFlight = new Set();
 
-// ─── Persistent store (номер контракту + історія) ─────────────────
+// ─── Persistent store ─────────────────────────────────────────────
 function defaultData() {
   return { nextNumber: 1, submissions: [] };
 }
@@ -274,27 +274,6 @@ async function registerCommands() {
 client.once('ready', async () => {
   console.log(`🤖 Bot online: ${client.user.tag}`);
   await registerCommands();
-
-  for (const [label, id] of [
-    ['CHANNEL_CONTRACTS', CHANNEL_CONTRACTS],
-    ['CHANNEL_REVIEW', CHANNEL_REVIEW],
-    ['CHANNEL_PAYOUTS', CHANNEL_PAYOUTS],
-  ]) {
-    if (!id) {
-      console.warn(`⚠️  ${label} is not set`);
-      continue;
-    }
-    const ch = client.channels.cache.get(id);
-    if (!ch) {
-      console.warn(`⚠️  ${label}=${id} not in cache yet`);
-      continue;
-    }
-    const me = ch.guild?.members?.me;
-    const perms = me ? ch.permissionsFor(me) : null;
-    if (perms && !perms.has(PermissionFlagsBits.ManageMessages) && label === 'CHANNEL_CONTRACTS') {
-      console.warn('⚠️  Bot lacks Manage Messages in the contracts channel — cannot delete user screenshots. Re-run /setup-channels or grant the permission.');
-    }
-  }
 });
 
 // ─── Message listener — catches screenshot ────────────────────────
@@ -323,15 +302,10 @@ client.on(Events.MessageCreate, async (message) => {
       state.screenshotTimer = null;
     }
 
-    // Delete the person's screenshot only AFTER we have a local copy.
     try {
       await message.delete();
     } catch (err) {
       console.warn('Could not delete user screenshot:', err.message);
-      const hint = await message.channel.send({
-        content: '⚠️ Не можу видалити скрін — дай боту право **Manage Messages** у цьому каналі.',
-      }).catch(() => null);
-      if (hint) setTimeout(() => hint.delete().catch(() => {}), 10000);
     }
 
     if (state.interaction) {
@@ -380,6 +354,9 @@ client.on('interactionCreate', async (interaction) => {
       }
       if (interaction.customId.startsWith('btn_reject_') || interaction.customId.startsWith('btn_reject:')) {
         return await handleReject(interaction);
+      }
+      if (interaction.customId.startsWith('btn_paid_') || interaction.customId.startsWith('btn_paid:')) {
+        return await handlePaid(interaction);
       }
     }
 
@@ -443,7 +420,6 @@ async function handleStart(interaction) {
 
   const payload = { content: null, embeds: [embed], components: [row], ephemeral: true };
 
-  // Never overwrite a public receipt / panel — always open a fresh ephemeral form.
   if (interaction.isButton() && interaction.message?.flags?.has(MessageFlags.Ephemeral)) {
     await interaction.update(payload);
   } else if (interaction.replied || interaction.deferred) {
@@ -524,7 +500,7 @@ async function handleMembersSelect(interaction) {
   await interaction.update({ embeds: [embed], components: [] });
 }
 
-// ─── Step 4: Payout choice (called after image received) ──────────
+// ─── Step 4: Payout choice ────────────────────────────────────────
 async function showPayoutStep(channel, state) {
   const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
 
@@ -569,7 +545,6 @@ async function showPayoutStep(channel, state) {
   state.payoutChannelId = sent.channelId;
 }
 
-// ─── Step 4 handler: payout selected ─────────────────────────────
 async function handlePayoutSelect(interaction) {
   const ownerId = interaction.customId.split(':')[1];
   if (ownerId && ownerId !== interaction.user.id) {
@@ -730,7 +705,6 @@ async function handleFinalSubmit(interaction) {
     ? [new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name })]
     : [];
 
-  // Keep the bot form in chat — edit it into a numbered receipt. Do NOT delete it.
   await interaction.editReply({
     content: null,
     embeds: [confirmEmbed],
@@ -765,21 +739,23 @@ async function handleApprove(interaction) {
     const imageFiles = await collectMessageImages(interaction.message);
 
     const payoutFields = plainFields(originalEmbed.fields)
-      .filter((f) => f.name !== '🕐 Час подання')
-      .concat([{
-        name: '🕐 Затверджено',
-        value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }),
-        inline: false,
-      }]);
+      .filter((f) => f.name !== '🕐 Час подання');
 
-    const approvedEmbed = new EmbedBuilder()
-      .setTitle(`💰 ${code} · Виплата затверджена`)
-      .setDescription(`✅ Перевірив: <@${interaction.user.id}>`)
+    const pendingPayoutEmbed = new EmbedBuilder()
+      .setTitle(`⏳ ${code} · Очікує виплати`)
+      .setDescription(`✅ Перевірив: <@${interaction.user.id}>\nОчікує видачі коштів керівником.`)
       .addFields(payoutFields)
-      .setColor(COLOR.ok)
+      .setColor(COLOR.gold)
       .setFooter({ text: `Kaneko Family • ${code}` });
 
-    if (imageFiles[0]) approvedEmbed.setImage(`attachment://${imageFiles[0].name}`);
+    if (imageFiles[0]) pendingPayoutEmbed.setImage(`attachment://${imageFiles[0].name}`);
+
+    const payoutRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`btn_paid:${number}`)
+        .setLabel('💸 Підтвердити виплату')
+        .setStyle(ButtonStyle.Success)
+    );
 
     const payoutsChannel = await getTextChannel(interaction.guild, CHANNEL_PAYOUTS);
     if (!payoutsChannel) {
@@ -791,8 +767,9 @@ async function handleApprove(interaction) {
     }
 
     await payoutsChannel.send({
-      embeds: [approvedEmbed],
+      embeds: [pendingPayoutEmbed],
       files: imageFiles.map((f) => f.attachment),
+      components: [payoutRow],
     });
 
     const updatedEmbed = new EmbedBuilder()
@@ -802,10 +779,9 @@ async function handleApprove(interaction) {
       .setColor(COLOR.ok)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
 
-    if (originalEmbed.image?.url) updatedEmbed.setImage(originalEmbed.image.url);
-    else if (imageFiles[0]) updatedEmbed.setImage(`attachment://${imageFiles[0].name}`);
-
-    await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
+    // Прибираємо скріншот із каналу перевірок, щоб залишити лише компактну форму,
+    // вказавши порожній масив attachments.
+    await interaction.message.edit({ embeds: [updatedEmbed], components: [], attachments: [] });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {
@@ -824,6 +800,51 @@ async function handleApprove(interaction) {
     }
   } finally {
     inFlight.delete(interaction.message.id);
+  }
+}
+
+// ─── Payout Confirmation ──────────────────────────────────────────
+async function handlePaid(interaction) {
+  if (!isReviewer(interaction.member)) {
+    return interaction.reply({ content: '❌ Немає права підтверджувати виплати.', ephemeral: true });
+  }
+
+  try {
+    await interaction.deferUpdate();
+
+    const originalEmbed = interaction.message.embeds[0];
+    if (!originalEmbed) throw new Error('У повідомленні немає ембеда');
+
+    const number = parseCodeFromFooter(originalEmbed.footer?.text)
+      || Number(String(interaction.customId).split(/[:_]/).pop());
+    const code = Number.isFinite(number) && number > 0 ? formatCode(number) : 'K-???';
+
+    const paidEmbed = new EmbedBuilder()
+      .setTitle(`💰 ${code} · Виплата затверджена`)
+      .setDescription(`${originalEmbed.description ?? ''}\n💸 Виплатив: <@${interaction.user.id}>`)
+      .addFields(plainFields(originalEmbed.fields))
+      .setColor(COLOR.ok)
+      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
+
+    if (originalEmbed.image?.url) paidEmbed.setImage(originalEmbed.image.url);
+
+    await interaction.message.edit({ embeds: [paidEmbed], components: [] });
+
+    if (Number.isFinite(number) && number > 0) {
+      await updateSubmission(number, {
+        status: 'paid',
+        paidBy: interaction.user.id,
+        paidAt: new Date().toISOString(),
+      });
+    }
+  } catch (err) {
+    console.error('Paid error:', err);
+    const msg = { content: `❌ Не вдалося підтвердити виплату: ${err.message}`, ephemeral: true };
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp(msg).catch(() => {});
+    } else {
+      await interaction.reply(msg).catch(() => {});
+    }
   }
 }
 
@@ -872,9 +893,8 @@ async function handleRejectModal(interaction) {
       .setColor(COLOR.bad)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
 
-    if (originalEmbed.image?.url) rejectedEmbed.setImage(originalEmbed.image.url);
-
-    await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
+    // Прибираємо скріншот із каналу перевірок
+    await interaction.message.edit({ embeds: [rejectedEmbed], components: [], attachments: [] });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {

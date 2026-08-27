@@ -97,9 +97,10 @@ client.on(Events.MessageCreate, async (message) => {
 
   // Got the image!
   state.screenshotUrl = image.url;
+  state.screenshotMessage = message; // save to delete later
   awaitingScreenshot.delete(message.author.id);
 
-  // Delete the user's image message to keep channel clean (optional)
+  // Delete the user's image message to keep channel clean
   try { await message.delete(); } catch {}
 
   // Show payout choice
@@ -359,6 +360,12 @@ async function handleFinalSubmit(interaction) {
     .setFooter({ text: 'Kaneko Family' });
 
   await interaction.editReply({ embeds: [confirmEmbed], components: [] });
+
+  // Delete the bot's payout message from the channel after a short delay
+  setTimeout(async () => {
+    try { await interaction.message.delete(); } catch {}
+  }, 3000);
+
   formState.delete(interaction.user.id);
 }
 
@@ -368,27 +375,42 @@ async function handleApprove(interaction) {
 
   const originalEmbed = interaction.message.embeds[0];
 
+  // Filter out the old timestamp field, add new one
+  const fields = originalEmbed.fields
+    .filter(f => f.name !== '🕐 Час подання')
+    .concat({ name: '🕐 Затверджено', value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }) });
+
   const approvedEmbed = new EmbedBuilder()
     .setTitle('💰 Виплата затверджена')
     .setDescription(`✅ Перевірив: <@${interaction.user.id}>`)
-    .addFields(...originalEmbed.fields.filter(f => f.name !== '🕐 Час подання'))
-    .addFields({ name: '🕐 Затверджено', value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }) })
-    .setImage(originalEmbed.image?.url || null)
+    .addFields(fields)
     .setColor(0x57f287)
     .setFooter({ text: 'Kaneko Family' });
+
+  // Set image only if it exists
+  if (originalEmbed.image?.url) {
+    approvedEmbed.setImage(originalEmbed.image.url);
+  }
 
   const payoutsChannel = CHANNEL_PAYOUTS ? interaction.guild.channels.cache.get(CHANNEL_PAYOUTS) : null;
   if (payoutsChannel) {
     await payoutsChannel.send({ embeds: [approvedEmbed] });
   }
 
-  const updatedEmbed = EmbedBuilder.from(originalEmbed)
+  // Update the review message
+  const updatedEmbed = new EmbedBuilder()
     .setTitle('📑 Контракт ✅ ЗАТВЕРДЖЕНО')
+    .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
+    .addFields(originalEmbed.fields)
     .setColor(0x57f287)
-    .setDescription(`${originalEmbed.description}\n\n✅ Затверджено: <@${interaction.user.id}>`);
+    .setFooter(originalEmbed.footer ?? { text: 'Kaneko Family' });
+
+  if (originalEmbed.image?.url) {
+    updatedEmbed.setImage(originalEmbed.image.url);
+  }
 
   await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
-  await interaction.editReply({ content: '✅ Контракт затверджено!' });
+  await interaction.editReply({ content: '✅ Контракт затверджено і виплату відправлено!' });
 }
 
 // ─── Reject ───────────────────────────────────────────────────────

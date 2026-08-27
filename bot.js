@@ -193,12 +193,6 @@ async function getTextChannel(guild, id) {
   return null;
 }
 
-function canManageMessages(channel, guild) {
-  const me = guild?.members?.me;
-  if (!me || !channel) return false;
-  return channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageMessages) ?? false;
-}
-
 function isReviewer(member) {
   if (!member) return false;
   if (!REVIEW_ROLE_ID) return true;
@@ -585,7 +579,8 @@ async function handlePayoutSelect(interaction) {
     files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
   }
 
-  await interaction.update({ embeds: [embed], components: [row], files });
+  // attachments: [] запобігає дублюванню зображень під час оновлення повідомлення
+  await interaction.update({ embeds: [embed], components: [row], files, attachments: [] });
 }
 
 // ─── Final submit ─────────────────────────────────────────────────
@@ -608,11 +603,7 @@ async function handleFinalSubmit(interaction) {
   const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
   const submittedAt = new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
 
-  const files = [];
-  if (state.screenshot) {
-    files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
-  }
-
+  const reviewFiles = [];
   const reviewEmbed = new EmbedBuilder()
     .setTitle(`📑 ${code} · На перевірку`)
     .setDescription(`Подав: <@${interaction.user.id}>`)
@@ -629,7 +620,10 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.gold)
     .setFooter({ text: `Kaneko Family • ${code} • ${interaction.user.id}` });
 
-  if (state.screenshot) reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
+  if (state.screenshot) {
+    reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
+    reviewFiles.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
+  }
 
   const approveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -654,7 +648,7 @@ async function handleFinalSubmit(interaction) {
   try {
     await reviewChannel.send({
       embeds: [reviewEmbed],
-      files,
+      files: reviewFiles,
       components: [approveRow],
     });
   } catch (err) {
@@ -692,7 +686,11 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.ok)
     .setFooter({ text: `Kaneko Family • ${code}` });
 
-  if (state.screenshot) confirmEmbed.setImage(`attachment://${state.screenshot.name}`);
+  const confirmFiles = [];
+  if (state.screenshot) {
+    confirmEmbed.setImage(`attachment://${state.screenshot.name}`);
+    confirmFiles.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
+  }
 
   const newContractRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -701,15 +699,13 @@ async function handleFinalSubmit(interaction) {
       .setStyle(ButtonStyle.Primary),
   );
 
-  const confirmFiles = state.screenshot
-    ? [new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name })]
-    : [];
-
+  // attachments: [] запобігає дублюванню зображень під час оновлення повідомлення
   await interaction.editReply({
     content: null,
     embeds: [confirmEmbed],
     components: [newContractRow],
     files: confirmFiles,
+    attachments: [],
   });
 
   clearSession(interaction.user.id);
@@ -748,7 +744,11 @@ async function handleApprove(interaction) {
       .setColor(COLOR.gold)
       .setFooter({ text: `Kaneko Family • ${code}` });
 
-    if (imageFiles[0]) pendingPayoutEmbed.setImage(`attachment://${imageFiles[0].name}`);
+    const filesToSend = [];
+    if (imageFiles[0]) {
+      pendingPayoutEmbed.setImage(`attachment://${imageFiles[0].name}`);
+      filesToSend.push(imageFiles[0].attachment);
+    }
 
     const payoutRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -768,7 +768,7 @@ async function handleApprove(interaction) {
 
     await payoutsChannel.send({
       embeds: [pendingPayoutEmbed],
-      files: imageFiles.map((f) => f.attachment),
+      files: filesToSend,
       components: [payoutRow],
     });
 
@@ -779,8 +779,7 @@ async function handleApprove(interaction) {
       .setColor(COLOR.ok)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
 
-    // Прибираємо скріншот із каналу перевірок, щоб залишити лише компактну форму,
-    // вказавши порожній масив attachments.
+    // Прибираємо скріншот із каналу перевірок
     await interaction.message.edit({ embeds: [updatedEmbed], components: [], attachments: [] });
 
     if (Number.isFinite(number) && number > 0) {
@@ -819,14 +818,26 @@ async function handlePaid(interaction) {
       || Number(String(interaction.customId).split(/[:_]/).pop());
     const code = Number.isFinite(number) && number > 0 ? formatCode(number) : 'K-???';
 
+    // Прибираємо рядок очікування і додаємо інформацію про виплату
+    let newDesc = originalEmbed.description || '';
+    newDesc = newDesc.replace('Очікує видачі коштів керівником.', '').trim();
+    newDesc += `\n💸 Виплатив: <@${interaction.user.id}>`;
+
     const paidEmbed = new EmbedBuilder()
       .setTitle(`💰 ${code} · Виплата затверджена`)
-      .setDescription(`${originalEmbed.description ?? ''}\n💸 Виплатив: <@${interaction.user.id}>`)
+      .setDescription(newDesc)
       .addFields(plainFields(originalEmbed.fields))
       .setColor(COLOR.ok)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
 
-    if (originalEmbed.image?.url) paidEmbed.setImage(originalEmbed.image.url);
+    // Щоб зображення не дублювалося як зовнішнє посилання + вкладення,
+    // прив'язуємо його до існуючого вкладення через attachment://
+    const attachment = interaction.message.attachments.first();
+    if (attachment) {
+      paidEmbed.setImage(`attachment://${attachment.name}`);
+    } else if (originalEmbed.image?.url) {
+      paidEmbed.setImage(originalEmbed.image.url);
+    }
 
     await interaction.message.edit({ embeds: [paidEmbed], components: [] });
 

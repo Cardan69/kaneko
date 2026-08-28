@@ -7,7 +7,10 @@ const {
 } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 require('dotenv').config();
+
+const BUILD_VERSION = '2026-08-28-v2-no-file-modal';
 
 const DATA_PATH = path.join(__dirname, 'data.json');
 const SCREENSHOT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -333,6 +336,7 @@ async function registerCommands() {
 // ─── Ready ────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`🤖 Bot online: ${client.user.tag}`);
+  console.log(`🧩 Build: ${BUILD_VERSION}`);
   try { console.log(`📦 discord.js version: ${require('discord.js').version}`); } catch {}
   await registerCommands();
 
@@ -1157,5 +1161,21 @@ async function handleSetupPanel(interaction) {
 
 client.on('error', (err) => console.error('Client error:', err));
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+
+// ─── Render health server ─────────────────────────────────────────
+// Render Web Services require an open HTTP port. Discord itself does not,
+// so this tiny health endpoint only keeps a Render Web Service healthy.
+// If you deploy as a Background Worker, PORT is normally absent and this is skipped.
+const RENDER_PORT = Number(process.env.PORT || 0);
+if (RENDER_PORT > 0) {
+  const healthServer = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(`Kaneko Discord bot is running (${BUILD_VERSION})`);
+  });
+
+  healthServer.listen(RENDER_PORT, '0.0.0.0', () => {
+    console.log(`🌐 Health server listening on port ${RENDER_PORT}`);
+  });
+}
 
 client.login(process.env.DISCORD_TOKEN);

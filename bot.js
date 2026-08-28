@@ -596,12 +596,6 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.gold)
     .setFooter({ text: `Kaneko Family • ${code} • ${interaction.user.id}` });
 
-  // В канал перевірки відправляємо реальний файл, щоб він зберігся на серверах Discord
-  if (state.screenshot) {
-    reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
-    reviewFiles.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
-  }
-
   const approveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`btn_approve:${number}`)

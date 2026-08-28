@@ -2,7 +2,7 @@ const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, UserSelectMenuBuilder, ModalBuilder,
-  TextInputBuilder, TextInputStyle, EmbedBuilder, AttachmentBuilder,
+  TextInputBuilder, TextInputStyle, EmbedBuilder, AttachmentBuilder, FileUploadBuilder,
   PermissionFlagsBits, ChannelType, Events, MessageFlags,
 } = require('discord.js');
 const fs = require('fs');
@@ -55,7 +55,7 @@ const inFlight = new Set();
 
 // ─── Persistent store (номер контракту + історія) ─────────────────
 function defaultData() {
-  return { nextNumber: 1, submissions: [] };
+  return { nextNumber: 1, submissions: [], expenses: [] };
 }
 
 function loadData() {
@@ -65,6 +65,7 @@ function loadData() {
     return {
       nextNumber: Number(raw.nextNumber) > 0 ? Number(raw.nextNumber) : 1,
       submissions: Array.isArray(raw.submissions) ? raw.submissions : [],
+      expenses: Array.isArray(raw.expenses) ? raw.expenses : [],
     };
   } catch {
     return defaultData();
@@ -123,9 +124,53 @@ function formatMoney(n) {
 
 function calcPayout(amount, count) {
   const safeCount = Math.max(1, count);
-  const family    = Math.round(amount * 0.20);
-  const perPerson = Math.round((amount - family) / safeCount);
-  return { family, perPerson };
+  const participantPool = Math.floor(Number(amount) * 0.80);
+  const perPerson = Math.floor(participantPool / safeCount);
+  const family = Number(amount) - (perPerson * safeCount);
+  return { family, perPerson, participantPool };
+}
+
+
+function getSubmissionByNumber(number) {
+  const data = loadData();
+  return data.submissions.find((s) => Number(s.number) === Number(number)) || null;
+}
+
+function getApprovedSubmissions() {
+  return loadData().submissions.filter((s) => s.status === 'approved');
+}
+
+function familyBalance() {
+  return getApprovedSubmissions().reduce((sum, s) => sum + Number(s.familyCredited || 0), 0);
+}
+
+function playerStats(userId) {
+  const rows = getApprovedSubmissions().filter((s) => (s.members || []).includes(userId));
+  let earned = 0;
+  let paid = 0;
+  let pending = 0;
+  for (const s of rows) {
+    if (s.payoutChoice !== 'self') continue;
+    const amount = Number(s.perPerson || 0);
+    earned += amount;
+    if (s.payoutStatus === 'paid') paid += amount;
+    else pending += amount;
+  }
+  return { contracts: rows.length, earned, paid, pending };
+}
+
+function familyStats() {
+  const rows = getApprovedSubmissions();
+  const turnover = rows.reduce((sum, s) => sum + Number(s.amount || 0), 0);
+  const credited = rows.reduce((sum, s) => sum + Number(s.familyCredited || 0), 0);
+  const participantPayouts = rows.reduce((sum, s) => sum + Number(s.participantPoolCredited || 0), 0);
+  const pending = rows.reduce((sum, s) => sum + Number(s.pendingPayoutTotal || 0), 0);
+  const paid = rows.reduce((sum, s) => sum + Number(s.paidPayoutTotal || 0), 0);
+  return { contracts: rows.length, turnover, credited, participantPayouts, pending, paid };
+}
+
+function isFamilyPayout(choice) {
+  return choice === 'family';
 }
 
 function isImageAttachment(att) {
@@ -201,9 +246,21 @@ function canManageMessages(channel, guild) {
 
 function isReviewer(member) {
   if (!member) return false;
-  if (!REVIEW_ROLE_ID) return true;
   if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
-  return member.roles.cache.has(REVIEW_ROLE_ID);
+
+  // Керівники KANEKO: Director та Overseer.
+  const hasLeadershipRole = member.roles.cache.some((role) =>
+    ['Director', 'Overseer'].includes(role.name),
+  );
+  if (hasLeadershipRole) return true;
+
+  // Додатково підтримуємо REVIEW_ROLE_ID у .env для сумісності.
+  if (REVIEW_ROLE_ID) {
+    const allowedIds = REVIEW_ROLE_ID.split(',').map((id) => id.trim()).filter(Boolean);
+    return allowedIds.some((id) => member.roles.cache.has(id));
+  }
+
+  return false;
 }
 
 function memberMentions(ids) {
@@ -211,7 +268,7 @@ function memberMentions(ids) {
 }
 
 function payoutLabel(choice) {
-  return choice === 'self' ? '💰 Отримати виплату собі' : '🏠 Віддати виплату сім\'ї';
+  return choice === 'self' ? '💰 Отримати особисту виплату' : '🏠 100% на баланс сім\'ї';
 }
 
 function clearSession(userId) {
@@ -256,6 +313,21 @@ async function registerCommands() {
       .setName('setup-panel')
       .setDescription('Опублікувати панель запуску контрактів у каналі')
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder()
+      .setName('stats')
+      .setDescription("Перегляд статистики сім'ї або гравця")
+      .addStringOption((o) => o
+        .setName('тип')
+        .setDescription('Що переглянути')
+        .setRequired(true)
+        .addChoices(
+          { name: "🏠 Сім'я", value: 'family' },
+          { name: '👤 Гравець', value: 'player' },
+        ))
+      .addUserOption((o) => o
+        .setName('гравець')
+        .setDescription("Гравець для статистики; для сім'ї не потрібен")
+        .setRequired(false)),
   ].map((c) => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -292,62 +364,13 @@ client.once('ready', async () => {
     const me = ch.guild?.members?.me;
     const perms = me ? ch.permissionsFor(me) : null;
     if (perms && !perms.has(PermissionFlagsBits.ManageMessages) && label === 'CHANNEL_CONTRACTS') {
-      console.warn('⚠️  Bot lacks Manage Messages in the contracts channel — cannot delete user screenshots. Re-run /setup-channels or grant the permission.');
+      console.warn('⚠️  Bot lacks Manage Messages in the contracts channel.');
     }
   }
 });
 
-// ─── Message listener — catches screenshot ────────────────────────
-client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-
-  const state = formState.get(message.author.id);
-  if (!state || state.step !== 'screenshot') return;
-  if (CHANNEL_CONTRACTS && message.channelId !== CHANNEL_CONTRACTS) return;
-
-  const image = message.attachments.find(isImageAttachment);
-  if (!image) {
-    const warn = await message.reply({
-      content: '❌ Надішли саме **зображення** (не файл, не посилання). Спробуй ще раз.',
-    }).catch(() => null);
-    if (warn) setTimeout(() => warn.delete().catch(() => {}), 8000);
-    return;
-  }
-
-  try {
-    const file = await downloadBuffer(image.url, image.name);
-    state.screenshot = file;
-    state.step = 'payout';
-    if (state.screenshotTimer) {
-      clearTimeout(state.screenshotTimer);
-      state.screenshotTimer = null;
-    }
-
-    // Delete the person's screenshot only AFTER we have a local copy.
-    try {
-      await message.delete();
-    } catch (err) {
-      console.warn('Could not delete user screenshot:', err.message);
-      const hint = await message.channel.send({
-        content: '⚠️ Не можу видалити скрін — дай боту право **Manage Messages** у цьому каналі.',
-      }).catch(() => null);
-      if (hint) setTimeout(() => hint.delete().catch(() => {}), 10000);
-    }
-
-    if (state.interaction) {
-      await state.interaction.editReply({
-        content: '✅ Скріншот отримано. Продовжи форму нижче.',
-        embeds: [],
-        components: [],
-      }).catch(() => {});
-    }
-
-    await showPayoutStep(message.channel, state);
-  } catch (err) {
-    console.error('Screenshot handling error:', err);
-    await message.reply({ content: '❌ Не вдалося обробити скріншот. Надішли зображення ще раз.' }).catch(() => {});
-  }
-});
+// ─── Screenshot is received privately inside a Discord modal ─────────
+// No screenshot message is ever sent to #📋・контракти.
 
 // ─── Interaction handler ──────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
@@ -357,6 +380,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.commandName === 'скасувати')      return await handleCancel(interaction);
       if (interaction.commandName === 'setup-channels') return await handleSetupChannels(interaction);
       if (interaction.commandName === 'setup-panel')    return await handleSetupPanel(interaction);
+      if (interaction.commandName === 'stats')          return await handleStats(interaction);
     }
 
     if (interaction.isStringSelectMenu()) {
@@ -381,11 +405,17 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId.startsWith('btn_reject_') || interaction.customId.startsWith('btn_reject:')) {
         return await handleReject(interaction);
       }
+      if (interaction.customId.startsWith('btn_confirm_payout:')) {
+        return await handleConfirmPayout(interaction);
+      }
     }
 
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith('modal_reject_') || interaction.customId.startsWith('modal_reject:')) {
         return await handleRejectModal(interaction);
+      }
+      if (interaction.customId.startsWith('modal_screenshot:')) {
+        return await handleScreenshotModal(interaction);
       }
     }
   } catch (err) {
@@ -480,7 +510,7 @@ async function handleContractSelect(interaction) {
       .setCustomId('select_members')
       .setPlaceholder('Обери учасників контракту...')
       .setMinValues(1)
-      .setMaxValues(4),
+      .setMaxValues(25),
   );
 
   const embed = new EmbedBuilder()
@@ -492,40 +522,63 @@ async function handleContractSelect(interaction) {
   await interaction.update({ embeds: [embed], components: [row] });
 }
 
-// ─── Step 3: Send screenshot in chat ─────────────────────────────
+// ─── Step 3: Screenshot in modal ──────────────────────────────────
 async function handleMembersSelect(interaction) {
   const state = formState.get(interaction.user.id);
   if (!(await assertOwner(interaction, state))) return;
 
   const ids = [...interaction.values];
-  if (!ids.includes(interaction.user.id) && ids.length < 4) {
-    ids.unshift(interaction.user.id);
+  if (!ids.includes(interaction.user.id)) ids.unshift(interaction.user.id);
+  state.members = [...new Set(ids)];
+
+  const modal = new ModalBuilder()
+    .setCustomId(`modal_screenshot:${state.userId}`)
+    .setTitle('Скріншот контракту');
+
+  const upload = new FileUploadBuilder()
+    .setCustomId('screenshot')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setRequired(true);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(upload),
+  );
+
+  await interaction.showModal(modal);
+}
+
+// ─── Step 3 handler: modal screenshot ─────────────────────────────
+async function handleScreenshotModal(interaction) {
+  const ownerId = interaction.customId.split(':')[1];
+  if (ownerId && ownerId !== interaction.user.id) {
+    return interaction.reply({ content: '❌ Це чужа форма.', ephemeral: true });
   }
-  state.members = ids;
-  state.step = 'screenshot';
-  state.interaction = interaction;
-  scheduleScreenshotTimeout(interaction.user.id);
 
-  const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
+  const state = formState.get(interaction.user.id);
+  if (!(await assertOwner(interaction, state))) return;
 
-  const embed = new EmbedBuilder()
-    .setTitle('📋 Новий контракт')
-    .setDescription('**Крок 3/4** — Надішли скріншот виконання\n\n📸 **Надішли фото прямо в цей канал** наступним повідомленням.\nБот забере скрін з чату і залишить форму.')
-    .addFields(
-      { name: '🎯 Контракт',         value: state.contract.name,                inline: true },
-      { name: '💵 Сума',             value: formatMoney(state.contract.amount), inline: true },
-      { name: '👥 Учасники',         value: memberMentions(state.members) },
-      { name: '🏠 Сім\'ї (20%)',     value: formatMoney(family),                inline: true },
-      { name: '💰 Кожному учаснику', value: formatMoney(perPerson),             inline: true },
-    )
-    .setColor(COLOR.gold)
-    .setFooter({ text: 'Просто прикріпи фото і надішли — бот його підхопить автоматично' });
+  const files = interaction.fields.getUploadedFiles('screenshot');
+  const uploaded = files?.first?.();
+  if (!uploaded || !isImageAttachment(uploaded)) {
+    return interaction.reply({ content: '❌ Потрібен саме скріншот-зображення.', ephemeral: true });
+  }
 
-  await interaction.update({ embeds: [embed], components: [] });
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const file = await downloadBuffer(uploaded.url, uploaded.name || 'screenshot.png');
+    state.screenshot = file;
+    state.step = 'payout';
+    state.interaction = interaction;
+    await showPayoutStep(interaction, state);
+  } catch (err) {
+    console.error('Screenshot modal error:', err);
+    await interaction.editReply({ content: '❌ Не вдалося обробити скріншот. Спробуй ще раз.' });
+  }
 }
 
 // ─── Step 4: Payout choice (called after image received) ──────────
-async function showPayoutStep(channel, state) {
+async function showPayoutStep(interaction, state) {
   const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
 
   const row = new ActionRowBuilder().addComponents(
@@ -533,8 +586,8 @@ async function showPayoutStep(channel, state) {
       .setCustomId(`select_payout:${state.userId}`)
       .setPlaceholder('Обери варіант виплати...')
       .addOptions([
-        { label: '💰 Отримати виплату собі',  value: 'self',   description: 'Твоя частка зараховується тобі' },
-        { label: '🏠 Віддати виплату сім\'ї', value: 'family', description: 'Твоя частка йде у фонд сім\'ї' },
+        { label: '💰 Отримати виплату собі', value: 'self', description: 'Твоя частка буде доступна для виплати' },
+        { label: "🏠 Зарахувати всю суму сім'ї", value: 'family', description: "100% суми піде на баланс сім'ї" },
       ]),
   );
 
@@ -542,31 +595,20 @@ async function showPayoutStep(channel, state) {
     .setTitle('📋 Новий контракт')
     .setDescription('**Крок 4/4** — Обери варіант виплати')
     .addFields(
-      { name: '🎯 Контракт',     value: state.contract.name,                inline: true },
-      { name: '💵 Сума',         value: formatMoney(state.contract.amount), inline: true },
-      { name: '👥 Учасники',     value: memberMentions(state.members) },
-      { name: '🏠 Сім\'ї (20%)', value: formatMoney(family),                inline: true },
-      { name: '💰 Твоя частка',  value: formatMoney(perPerson),             inline: true },
+      { name: '🎯 Контракт', value: state.contract.name, inline: true },
+      { name: '💵 Сума', value: formatMoney(state.contract.amount), inline: true },
+      { name: '👥 Учасники', value: memberMentions(state.members) },
+      { name: "🏠 Сім'ї (база 20%)", value: formatMoney(family), inline: true },
+      { name: '💰 Частка кожного', value: formatMoney(perPerson), inline: true },
     )
     .setColor(COLOR.ink)
     .setFooter({ text: 'Kaneko Family' });
 
-  const files = [];
-  if (state.screenshot) {
-    embed.setImage(`attachment://${state.screenshot.name}`);
-    files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
-  }
+  const files = state.screenshot
+    ? [new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name })]
+    : [];
 
-  const sent = await channel.send({
-    content: `<@${state.userId}>`,
-    embeds: [embed],
-    files,
-    components: [row],
-    allowedMentions: { users: [state.userId] },
-  });
-
-  state.payoutMessageId = sent.id;
-  state.payoutChannelId = sent.channelId;
+  await interaction.editReply({ content: null, embeds: [embed], components: [row], files });
 }
 
 // ─── Step 4 handler: payout selected ─────────────────────────────
@@ -582,6 +624,7 @@ async function handlePayoutSelect(interaction) {
   state.payoutChoice = interaction.values[0];
 
   const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
+  const displayFamily = state.payoutChoice === 'family' ? state.contract.amount : family;
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -597,8 +640,8 @@ async function handlePayoutSelect(interaction) {
       { name: '🎯 Контракт',         value: state.contract.name,                inline: true },
       { name: '💵 Загальна сума',    value: formatMoney(state.contract.amount), inline: true },
       { name: '👥 Учасники',         value: memberMentions(state.members) },
-      { name: '🏠 Сім\'ї (20%)',     value: formatMoney(family),                inline: true },
-      { name: '💰 Кожному учаснику', value: formatMoney(perPerson),             inline: true },
+      { name: '🏠 Сім\'ї',     value: formatMoney(displayFamily),                inline: true },
+      { name: '💰 Кожному учаснику', value: state.payoutChoice === 'family' ? '$0' : formatMoney(perPerson),             inline: true },
       { name: '📤 Ваш вибір',        value: payoutLabel(state.payoutChoice) },
     )
     .setColor(COLOR.gold)
@@ -606,7 +649,6 @@ async function handlePayoutSelect(interaction) {
 
   const files = [];
   if (state.screenshot) {
-    embed.setImage(`attachment://${state.screenshot.name}`);
     files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
   }
 
@@ -631,6 +673,8 @@ async function handleFinalSubmit(interaction) {
   const number = await allocateNumber();
   const code = formatCode(number);
   const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
+  const displayFamily = state.payoutChoice === 'family' ? state.contract.amount : family;
+  const displayPerPerson = state.payoutChoice === 'family' ? 0 : perPerson;
   const submittedAt = new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' });
 
   const files = [];
@@ -646,15 +690,13 @@ async function handleFinalSubmit(interaction) {
       { name: '🎯 Контракт',         value: state.contract.name,                inline: true },
       { name: '💵 Загальна сума',    value: formatMoney(state.contract.amount), inline: true },
       { name: '👥 Учасники',         value: memberMentions(state.members) },
-      { name: '🏠 Сім\'ї (20%)',     value: formatMoney(family),                inline: true },
-      { name: '💰 Кожному учаснику', value: formatMoney(perPerson),             inline: true },
+      { name: '🏠 Сім\'ї',     value: formatMoney(displayFamily),                inline: true },
+      { name: '💰 Кожному учаснику', value: formatMoney(displayPerPerson),             inline: true },
       { name: '📤 Вибір виплати',    value: payoutLabel(state.payoutChoice) },
       { name: '🕐 Час подання',      value: submittedAt },
     )
     .setColor(COLOR.gold)
     .setFooter({ text: `Kaneko Family • ${code} • ${interaction.user.id}` });
-
-  if (state.screenshot) reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
 
   const approveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -704,6 +746,11 @@ async function handleFinalSubmit(interaction) {
     submittedAt: new Date().toISOString(),
     reviewerId: null,
     rejectReason: null,
+    payoutStatus: state.payoutChoice === 'family' ? 'family' : 'pending',
+    familyCredited: 0,
+    participantPoolCredited: 0,
+    pendingPayoutTotal: 0,
+    paidPayoutTotal: 0,
   });
 
   const confirmEmbed = new EmbedBuilder()
@@ -717,7 +764,6 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.ok)
     .setFooter({ text: `Kaneko Family • ${code}` });
 
-  if (state.screenshot) confirmEmbed.setImage(`attachment://${state.screenshot.name}`);
 
   const newContractRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -754,77 +800,124 @@ async function handleApprove(interaction) {
 
   try {
     await interaction.deferUpdate();
-
     const originalEmbed = interaction.message.embeds[0];
     if (!originalEmbed) throw new Error('У повідомленні немає ембеда');
 
     const number = parseCodeFromFooter(originalEmbed.footer?.text)
       || Number(String(interaction.customId).split(/[:_]/).pop());
-    const code = Number.isFinite(number) && number > 0 ? formatCode(number) : 'K-???';
+    const submission = getSubmissionByNumber(number);
+    if (!submission || submission.status !== 'pending') {
+      throw new Error('Заявку не знайдено або її вже оброблено.');
+    }
 
     const imageFiles = await collectMessageImages(interaction.message);
+    const familyMode = isFamilyPayout(submission.payoutChoice);
+    const { family, perPerson, participantPool } = calcPayout(submission.amount, submission.members.length);
+    const familyCredited = familyMode ? Number(submission.amount) : family;
+    const pendingPayoutTotal = familyMode ? 0 : perPerson * submission.members.length;
 
     const payoutFields = plainFields(originalEmbed.fields)
       .filter((f) => f.name !== '🕐 Час подання')
-      .concat([{
-        name: '🕐 Затверджено',
-        value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }),
-        inline: false,
-      }]);
+      .concat([
+        { name: '🕐 Затверджено', value: new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' }), inline: false },
+        { name: "🏦 До балансу сім'ї", value: formatMoney(familyCredited), inline: true },
+        { name: '💳 Статус виплати', value: familyMode ? "🏠 Зараховано повністю сім'ї" : '🟡 Очікує фактичної виплати', inline: true },
+      ]);
 
     const approvedEmbed = new EmbedBuilder()
-      .setTitle(`💰 ${code} · Виплата затверджена`)
+      .setTitle(`💰 ${submission.code} · Виплата затверджена`)
       .setDescription(`✅ Перевірив: <@${interaction.user.id}>`)
       .addFields(payoutFields)
       .setColor(COLOR.ok)
-      .setFooter({ text: `Kaneko Family • ${code}` });
-
-    if (imageFiles[0]) approvedEmbed.setImage(`attachment://${imageFiles[0].name}`);
-
+      .setFooter({ text: `Kaneko Family • ${submission.code}` });
     const payoutsChannel = await getTextChannel(interaction.guild, CHANNEL_PAYOUTS);
-    if (!payoutsChannel) {
-      await interaction.followUp({
-        content: '❌ Канал виплат не знайдено. Перевір `CHANNEL_PAYOUTS`.',
-        ephemeral: true,
-      });
-      return;
+    if (!payoutsChannel) throw new Error('Канал виплат не знайдено. Перевір CHANNEL_PAYOUTS.');
+
+    const payoutComponents = [];
+    if (!familyMode) {
+      payoutComponents.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`btn_confirm_payout:${number}`)
+          .setLabel('💵 Підтвердити виплату')
+          .setStyle(ButtonStyle.Success),
+      ));
     }
 
     await payoutsChannel.send({
       embeds: [approvedEmbed],
       files: imageFiles.map((f) => f.attachment),
+      components: payoutComponents,
+    });
+
+    await updateSubmission(number, {
+      status: 'approved',
+      reviewerId: interaction.user.id,
+      reviewedAt: new Date().toISOString(),
+      familyCredited,
+      participantPoolCredited: familyMode ? 0 : participantPool,
+      pendingPayoutTotal,
+      paidPayoutTotal: 0,
+      payoutStatus: familyMode ? 'family' : 'pending',
+      payoutApprovedAt: new Date().toISOString(),
+      perPerson,
     });
 
     const updatedEmbed = new EmbedBuilder()
-      .setTitle(`📑 ${code} · ЗАТВЕРДЖЕНО`)
-      .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
+      .setTitle(`📑 ${submission.code} · ЗАТВЕРДЖЕНО`)
+      .setDescription(`${originalEmbed.description ?? ''}
+
+✅ Затверджено: <@${interaction.user.id}>`)
       .addFields(plainFields(originalEmbed.fields))
       .setColor(COLOR.ok)
-      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
-
-    if (originalEmbed.image?.url) updatedEmbed.setImage(originalEmbed.image.url);
-    else if (imageFiles[0]) updatedEmbed.setImage(`attachment://${imageFiles[0].name}`);
-
+      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${submission.code}` });
     await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
-
-    if (Number.isFinite(number) && number > 0) {
-      await updateSubmission(number, {
-        status: 'approved',
-        reviewerId: interaction.user.id,
-        reviewedAt: new Date().toISOString(),
-      });
-    }
   } catch (err) {
     console.error('Approve error:', err);
     const msg = { content: `❌ Не вдалося затвердити: ${err.message}`, ephemeral: true };
-    if (interaction.deferred || interaction.replied) {
-      await interaction.followUp(msg).catch(() => {});
-    } else {
-      await interaction.reply(msg).catch(() => {});
-    }
+    if (interaction.deferred || interaction.replied) await interaction.followUp(msg).catch(() => {});
+    else await interaction.reply(msg).catch(() => {});
   } finally {
     inFlight.delete(interaction.message.id);
   }
+}
+
+// ─── Confirm actual payout ─────────────────────────────────────────
+async function handleConfirmPayout(interaction) {
+  if (!isReviewer(interaction.member)) {
+    return interaction.reply({ content: '❌ Тільки Director або Overseer можуть підтвердити виплату.', ephemeral: true });
+  }
+
+  const number = Number(String(interaction.customId).split(':').pop());
+  const submission = getSubmissionByNumber(number);
+  if (!submission || submission.status !== 'approved') {
+    return interaction.reply({ content: '❌ Контракт не знайдено або він не затверджений.', ephemeral: true });
+  }
+  if (submission.payoutChoice !== 'self') {
+    return interaction.reply({ content: "ℹ️ Для цього контракту виплата йде повністю на баланс сім'ї.", ephemeral: true });
+  }
+  if (submission.payoutStatus === 'paid') {
+    return interaction.reply({ content: '⚠️ Цю виплату вже підтверджено.', ephemeral: true });
+  }
+
+  const now = new Date().toISOString();
+  await updateSubmission(number, {
+    payoutStatus: 'paid',
+    paidPayoutTotal: Number(submission.pendingPayoutTotal || 0),
+    pendingPayoutTotal: 0,
+    payoutPaidAt: now,
+    payoutPaidBy: interaction.user.id,
+  });
+
+  const embed = EmbedBuilder.from(interaction.message.embeds[0])
+    .setTitle(`💵 ${submission.code} · ВИПЛАТУ ПІДТВЕРДЖЕНО`)
+    .setColor(COLOR.ok)
+    .setDescription(`${interaction.message.embeds[0].description ?? ''}
+
+🟢 Кошти фактично передано учасникам.
+👤 Підтвердив: <@${interaction.user.id}>
+🕐 ${new Date().toLocaleString('uk-UA', { timeZone: 'Europe/Kyiv' })}`);
+
+  await interaction.update({ embeds: [embed], components: [] });
 }
 
 // ─── Reject ───────────────────────────────────────────────────────
@@ -872,8 +965,6 @@ async function handleRejectModal(interaction) {
       .setColor(COLOR.bad)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
 
-    if (originalEmbed.image?.url) rejectedEmbed.setImage(originalEmbed.image.url);
-
     await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
 
     if (Number.isFinite(number) && number > 0) {
@@ -905,6 +996,46 @@ async function handleRejectModal(interaction) {
       ephemeral: true,
     }).catch(() => {});
   }
+}
+
+// ─── Statistics ────────────────────────────────────────────────────
+async function handleStats(interaction) {
+  const type = interaction.options.getString('тип');
+  const target = interaction.options.getUser('гравець');
+
+  if (type === 'family') {
+    const s = familyStats();
+    const embed = new EmbedBuilder()
+      .setTitle("🏠 KANEKO · Статистика сім'ї")
+      .addFields(
+        { name: '🚚 Виконано контрактів', value: String(s.contracts), inline: true },
+        { name: '💵 Загальний оборот', value: formatMoney(s.turnover), inline: true },
+        { name: "🏦 Баланс сім'ї", value: formatMoney(s.credited), inline: true },
+        { name: '💰 Усього учасникам', value: formatMoney(s.participantPayouts), inline: true },
+        { name: '🟡 Очікує виплати', value: formatMoney(s.pending), inline: true },
+        { name: '🟢 Виплачено', value: formatMoney(s.paid), inline: true },
+      )
+      .setColor(COLOR.gold)
+      .setFooter({ text: 'Kaneko Family' });
+    return interaction.reply({ embeds: [embed], ephemeral: true });
+  }
+
+  const user = target || interaction.user;
+  const s = playerStats(user.id);
+  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+  const nickname = member?.displayName || user.globalName || user.username;
+  const embed = new EmbedBuilder()
+    .setTitle(`👤 Статистика · ${nickname}`)
+    .setDescription(`<@${user.id}>`)
+    .addFields(
+      { name: '🚚 Виконано контрактів', value: String(s.contracts), inline: true },
+      { name: '💰 Зароблено', value: formatMoney(s.earned), inline: true },
+      { name: '🟢 Виплачено', value: formatMoney(s.paid), inline: true },
+      { name: '🟡 Очікує виплати', value: formatMoney(s.pending), inline: true },
+    )
+    .setColor(COLOR.gold)
+    .setFooter({ text: 'Kaneko Family' });
+  return interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
 // ─── Setup channels ───────────────────────────────────────────────
@@ -966,7 +1097,7 @@ async function handleSetupChannels(interaction) {
   }
 
   await interaction.editReply({
-    content: `✅ **Канали готові!**\n\n${created.join('\n')}\n\n📌 Скопіюй ID у змінні середовища:\n\`\`\`\nCHANNEL_CONTRACTS=${ids.CHANNEL_CONTRACTS}\nCHANNEL_REVIEW=${ids.CHANNEL_REVIEW}\nCHANNEL_PAYOUTS=${ids.CHANNEL_PAYOUTS}\n\`\`\`\n\nБот отримав право **Manage Messages**, щоб видаляти скріни з чату.`,
+    content: `✅ **Канали готові!**\n\n${created.join('\n')}\n\n📌 Скопіюй ID у змінні середовища:\n\`\`\`\nCHANNEL_CONTRACTS=${ids.CHANNEL_CONTRACTS}\nCHANNEL_REVIEW=${ids.CHANNEL_REVIEW}\nCHANNEL_PAYOUTS=${ids.CHANNEL_PAYOUTS}\n\`\`\`\n\nБот налаштований для роботи з формами та контрактами.`,
   });
 }
 
@@ -983,7 +1114,7 @@ async function handleSetupPanel(interaction) {
 
   const embed = new EmbedBuilder()
     .setTitle('Kaneko Family · Контракти')
-    .setDescription('Натисни кнопку, щоб подати виконаний контракт.\nСкріншот з чату забере бот, форма залишиться як квитанція з номером.')
+    .setDescription('Натисни кнопку, щоб подати виконаний контракт.\nСкріншот додається приватно у форму та не публікується окремим повідомленням.')
     .addFields(
       { name: 'Наступний номер', value: `\`${next}\``, inline: true },
       { name: 'Типів контрактів', value: String(CONTRACTS.length), inline: true },

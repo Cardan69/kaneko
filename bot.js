@@ -149,29 +149,6 @@ async function downloadBuffer(url, name = 'screenshot.png') {
   return { buffer, name: filename, attachment: new AttachmentBuilder(buffer, { name: filename }) };
 }
 
-async function collectMessageImages(message) {
-  const out = [];
-  for (const att of message.attachments.values()) {
-    if (!isImageAttachment(att)) continue;
-    try {
-      out.push(await downloadBuffer(att.url, att.name));
-    } catch (err) {
-      console.warn('Attachment download failed:', err.message);
-    }
-  }
-  if (!out.length) {
-    const url = message.embeds[0]?.image?.url;
-    if (url) {
-      try {
-        out.push(await downloadBuffer(url, 'screenshot.png'));
-      } catch (err) {
-        console.warn('Embed image download failed:', err.message);
-      }
-    }
-  }
-  return out;
-}
-
 function plainFields(fields) {
   return (fields || [])
     .filter((f) => f && f.name)
@@ -427,7 +404,7 @@ async function handleCancel(interaction) {
   const existed = formState.has(interaction.user.id);
   clearSession(interaction.user.id);
   await interaction.reply({
-    content: existed ? '✅ Форму скасовано.' : 'Немає активної форми.',
+    content: existed ? '✅ Форму скасовано.' : 'Немає активної active форми.',
     ephemeral: true,
   });
 }
@@ -579,7 +556,6 @@ async function handlePayoutSelect(interaction) {
     files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
   }
 
-  // attachments: [] запобігає дублюванню зображень під час оновлення повідомлення
   await interaction.update({ embeds: [embed], components: [row], files, attachments: [] });
 }
 
@@ -620,6 +596,7 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.gold)
     .setFooter({ text: `Kaneko Family • ${code} • ${interaction.user.id}` });
 
+  // В канал перевірки відправляємо реальний файл, щоб він зберігся на серверах Discord
   if (state.screenshot) {
     reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
     reviewFiles.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
@@ -699,7 +676,6 @@ async function handleFinalSubmit(interaction) {
       .setStyle(ButtonStyle.Primary),
   );
 
-  // attachments: [] запобігає дублюванню зображень під час оновлення повідомлення
   await interaction.editReply({
     content: null,
     embeds: [confirmEmbed],
@@ -732,10 +708,12 @@ async function handleApprove(interaction) {
       || Number(String(interaction.customId).split(/[:_]/).pop());
     const code = Number.isFinite(number) && number > 0 ? formatCode(number) : 'K-???';
 
-    const imageFiles = await collectMessageImages(interaction.message);
-
     const payoutFields = plainFields(originalEmbed.fields)
       .filter((f) => f.name !== '🕐 Час подання');
+
+    // Створюємо повідомлення для виплат. 
+    // Замість того, щоб завантажувати файл, ми просто беремо URL-посилання з оригінального ембеду!
+    const imageUrl = originalEmbed.image?.url;
 
     const pendingPayoutEmbed = new EmbedBuilder()
       .setTitle(`⏳ ${code} · Очікує виплати`)
@@ -744,10 +722,8 @@ async function handleApprove(interaction) {
       .setColor(COLOR.gold)
       .setFooter({ text: `Kaneko Family • ${code}` });
 
-    const filesToSend = [];
-    if (imageFiles[0]) {
-      pendingPayoutEmbed.setImage(`attachment://${imageFiles[0].name}`);
-      filesToSend.push(imageFiles[0].attachment);
+    if (imageUrl) {
+      pendingPayoutEmbed.setImage(imageUrl);
     }
 
     const payoutRow = new ActionRowBuilder().addComponents(
@@ -766,21 +742,25 @@ async function handleApprove(interaction) {
       return;
     }
 
+    // Відправляємо без масиву files. Це гарантує, що Discord не прикріпить "відокремлений" файл, і він ніколи не зможе задублюватися.
     await payoutsChannel.send({
       embeds: [pendingPayoutEmbed],
-      files: filesToSend,
       components: [payoutRow],
     });
 
-    const updatedEmbed = new EmbedBuilder()
+    // Оновлюємо статус у каналі перевірок (використовуємо EmbedBuilder.from для збереження структури)
+    const updatedEmbed = EmbedBuilder.from(originalEmbed)
       .setTitle(`📑 ${code} · ЗАТВЕРДЖЕНО`)
       .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
-      .addFields(plainFields(originalEmbed.fields))
-      .setColor(COLOR.ok)
-      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
+      .setColor(COLOR.ok);
 
-    // Прибираємо скріншот із каналу перевірок
-    await interaction.message.edit({ embeds: [updatedEmbed], components: [], attachments: [] });
+    const attachment = interaction.message.attachments.first();
+    if (attachment) {
+      updatedEmbed.setImage(`attachment://${attachment.name}`);
+    }
+
+    // Ми НЕ очищаємо attachments: [], щоб не зламати посилання, яке ми щойно відправили в канал виплат
+    await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {
@@ -823,22 +803,13 @@ async function handlePaid(interaction) {
     newDesc = newDesc.replace('Очікує видачі коштів керівником.', '').trim();
     newDesc += `\n💸 Виплатив: <@${interaction.user.id}>`;
 
-    const paidEmbed = new EmbedBuilder()
+    const paidEmbed = EmbedBuilder.from(originalEmbed)
       .setTitle(`💰 ${code} · Виплата затверджена`)
       .setDescription(newDesc)
-      .addFields(plainFields(originalEmbed.fields))
-      .setColor(COLOR.ok)
-      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
+      .setColor(COLOR.ok);
 
-    // Щоб зображення не дублювалося як зовнішнє посилання + вкладення,
-    // прив'язуємо його до існуючого вкладення через attachment://
-    const attachment = interaction.message.attachments.first();
-    if (attachment) {
-      paidEmbed.setImage(`attachment://${attachment.name}`);
-    } else if (originalEmbed.image?.url) {
-      paidEmbed.setImage(originalEmbed.image.url);
-    }
-
+    // Оскільки ми більше не маємо прикріплених файлів у цьому каналі, 
+    // EmbedBuilder.from вже скопіював URL-картинки (setImage), і цього достатньо
     await interaction.message.edit({ embeds: [paidEmbed], components: [] });
 
     if (Number.isFinite(number) && number > 0) {
@@ -897,15 +868,17 @@ async function handleRejectModal(interaction) {
     const number = parseCodeFromFooter(originalEmbed.footer?.text) || Number(token);
     const code = Number.isFinite(number) && number > 0 ? formatCode(number) : 'K-???';
 
-    const rejectedEmbed = new EmbedBuilder()
+    const rejectedEmbed = EmbedBuilder.from(originalEmbed)
       .setTitle(`📑 ${code} · ВІДХИЛЕНО`)
       .setDescription(`${originalEmbed.description ?? ''}\n\n❌ Відхилив: <@${interaction.user.id}>\n📝 Причина: ${reason}`)
-      .addFields(plainFields(originalEmbed.fields))
-      .setColor(COLOR.bad)
-      .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
+      .setColor(COLOR.bad);
 
-    // Прибираємо скріншот із каналу перевірок
-    await interaction.message.edit({ embeds: [rejectedEmbed], components: [], attachments: [] });
+    const attachment = interaction.message.attachments.first();
+    if (attachment) {
+      rejectedEmbed.setImage(`attachment://${attachment.name}`);
+    }
+
+    await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {

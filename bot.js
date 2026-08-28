@@ -712,8 +712,9 @@ async function handleApprove(interaction) {
       .filter((f) => f.name !== '🕐 Час подання');
 
     // Створюємо повідомлення для виплат. 
-    // Замість того, щоб завантажувати файл, ми просто беремо URL-посилання з оригінального ембеду!
-    const imageUrl = originalEmbed.image?.url;
+    // Беремо постійне публічне посилання на картинку, замінюючи локальний attachment://
+    const imageEl = originalEmbed.image;
+    const imageUrl = imageEl?.proxyURL || imageEl?.url;
 
     const pendingPayoutEmbed = new EmbedBuilder()
       .setTitle(`⏳ ${code} · Очікує виплати`)
@@ -910,7 +911,90 @@ async function handleRejectModal(interaction) {
     }).catch(() => {});
   }
 }
+// ─── Statistics ───────────────────────────────────────────────────
+async function handleStats(interaction) {
+  await interaction.deferReply(); // Статистика може рахуватися довго, тому даємо боту час
 
+  const targetUser = interaction.options.getUser('гравець');
+  const data = loadData();
+  
+  // Рахуємо тільки успішно виплачені контракти
+  const paidContracts = (data.submissions || []).filter(s => s.status === 'paid');
+
+  if (targetUser) {
+    // ─── Статистика конкретного гравця ───
+    const userContracts = paidContracts.filter(s => s.members && s.members.includes(targetUser.id));
+    
+    let totalPersonal = 0;
+    let totalToFamily = 0; // Скільки частки цього гравця пішло в фонд сім'ї
+
+    userContracts.forEach(c => {
+      const membersCount = c.members?.length || 1;
+      const { perPerson } = calcPayout(c.amount, membersCount);
+      
+      // Оскільки вибір (собі чи сім'ї) робить ініціатор, припускаємо, що він стосується всієї групи
+      if (c.payoutChoice === 'self') {
+        totalPersonal += perPerson;
+      } else {
+        totalToFamily += perPerson;
+      }
+    });
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📊 Статистика гравця: ${targetUser.username}`)
+      .setThumbnail(targetUser.displayAvatarURL())
+      .addFields(
+        { name: '✅ Виконано контрактів', value: `${userContracts.length}`, inline: true },
+        { name: '💰 Зароблено особисто', value: formatMoney(totalPersonal), inline: true },
+        { name: '🏠 Передано в сім\'ю', value: formatMoney(totalToFamily), inline: true }
+      )
+      .setColor(COLOR.gold)
+      .setFooter({ text: 'Kaneko Family' });
+
+    return interaction.editReply({ embeds: [embed] });
+
+  } else {
+    // ─── Загальна статистика сім'ї ───
+    let totalAmount = 0;
+    let totalTax = 0;        // Обов'язкові 20%
+    let totalVoluntary = 0;  // Ті, хто вибрав "Віддати сім'ї" (їхні 80%)
+    let totalToPlayers = 0;
+
+    paidContracts.forEach(c => {
+      totalAmount += c.amount;
+      const membersCount = c.members?.length || 1;
+      const { family, perPerson } = calcPayout(c.amount, membersCount);
+      
+      totalTax += family;
+      
+      const totalShare = perPerson * membersCount;
+      if (c.payoutChoice === 'family') {
+        totalVoluntary += totalShare;
+      } else {
+        totalToPlayers += totalShare;
+      }
+    });
+
+    const totalFamilyFund = totalTax + totalVoluntary;
+
+    const embed = new EmbedBuilder()
+      .setTitle('📈 Загальна статистика Kaneko Family')
+      .setDescription('Дані базуються виключно на **виплачених** контрактах.')
+      .addFields(
+        { name: '✅ Всього контрактів', value: `${paidContracts.length}`, inline: true },
+        { name: '💵 Загальний обіг', value: formatMoney(totalAmount), inline: true },
+        { name: '\u200b', value: '\u200b', inline: true }, // Пусте поле для рівної сітки
+        { name: '🏦 Фонд (податок 20%)', value: formatMoney(totalTax), inline: true },
+        { name: '🎁 Добровільні внески', value: formatMoney(totalVoluntary), inline: true },
+        { name: '💰 Виплачено на руки', value: formatMoney(totalToPlayers), inline: true },
+        { name: '🏠 Загалом у сім\'ї', value: formatMoney(totalFamilyFund), inline: false }
+      )
+      .setColor(COLOR.ink)
+      .setFooter({ text: 'Kaneko Family' });
+
+    return interaction.editReply({ embeds: [embed] });
+  }
+}
 // ─── Setup channels ───────────────────────────────────────────────
 async function handleSetupChannels(interaction) {
   await interaction.deferReply({ ephemeral: true });

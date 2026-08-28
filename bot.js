@@ -705,8 +705,7 @@ async function handleApprove(interaction) {
     const payoutFields = plainFields(originalEmbed.fields)
       .filter((f) => f.name !== '🕐 Час подання');
 
-    // Створюємо повідомлення для виплат. 
-    // Беремо постійне публічне посилання на картинку, замінюючи локальний attachment://
+    // Отримуємо публічне посилання на картинку, щоб уникнути дублювання
     const imageEl = originalEmbed.image;
     const imageUrl = imageEl?.proxyURL || imageEl?.url;
 
@@ -737,25 +736,27 @@ async function handleApprove(interaction) {
       return;
     }
 
-    // Відправляємо без масиву files. Це гарантує, що Discord не прикріпить "відокремлений" файл, і він ніколи не зможе задублюватися.
+    // Відправляємо у виплати чисто через URL без локального файлу
     await payoutsChannel.send({
       embeds: [pendingPayoutEmbed],
       components: [payoutRow],
     });
 
-    // Оновлюємо статус у каналі перевірок (використовуємо EmbedBuilder.from для збереження структури)
+    // Оновлюємо ембед у перевірках, переводимо картинку на публічний URL і повністю скидаємо локальні прикріплені файли (attachments: [])
     const updatedEmbed = EmbedBuilder.from(originalEmbed)
       .setTitle(`📑 ${code} · ЗАТВЕРДЖЕНО`)
       .setDescription(`${originalEmbed.description ?? ''}\n\n✅ Затверджено: <@${interaction.user.id}>`)
       .setColor(COLOR.ok);
 
-    const attachment = interaction.message.attachments.first();
-    if (attachment) {
-      updatedEmbed.setImage(`attachment://${attachment.name}`);
+    if (imageUrl) {
+      updatedEmbed.setImage(imageUrl);
     }
 
-    // Ми НЕ очищаємо attachments: [], щоб не зламати посилання, яке ми щойно відправили в канал виплат
-    await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
+    await interaction.message.edit({ 
+      embeds: [updatedEmbed], 
+      components: [], 
+      files: [] // Очищаємо фізичні файли повідомлення, щоб Discord не дублював їх візуально
+    });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {
@@ -873,7 +874,15 @@ async function handleRejectModal(interaction) {
       rejectedEmbed.setImage(`attachment://${attachment.name}`);
     }
 
-    await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
+    if (imageUrl) {
+      rejectedEmbed.setImage(imageUrl);
+    }
+
+    await interaction.message.edit({ 
+      embeds: [rejectedEmbed], 
+      components: [],
+      files: [] // Запобігає дублюванню і при відхиленні
+    });
 
     if (Number.isFinite(number) && number > 0) {
       await updateSubmission(number, {

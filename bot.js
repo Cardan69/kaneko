@@ -2,7 +2,7 @@ const {
   Client, GatewayIntentBits, Partials, REST, Routes,
   SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, UserSelectMenuBuilder, ModalBuilder,
-  TextInputBuilder, TextInputStyle, EmbedBuilder, AttachmentBuilder, FileUploadBuilder,
+  TextInputBuilder, TextInputStyle, EmbedBuilder, AttachmentBuilder,
   PermissionFlagsBits, ChannelType, Events, MessageFlags,
 } = require('discord.js');
 const fs = require('fs');
@@ -246,21 +246,9 @@ function canManageMessages(channel, guild) {
 
 function isReviewer(member) {
   if (!member) return false;
+  if (!REVIEW_ROLE_ID) return true;
   if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
-
-  // Керівники KANEKO: Director та Overseer.
-  const hasLeadershipRole = member.roles.cache.some((role) =>
-    ['Director', 'Overseer'].includes(role.name),
-  );
-  if (hasLeadershipRole) return true;
-
-  // Додатково підтримуємо REVIEW_ROLE_ID у .env для сумісності.
-  if (REVIEW_ROLE_ID) {
-    const allowedIds = REVIEW_ROLE_ID.split(',').map((id) => id.trim()).filter(Boolean);
-    return allowedIds.some((id) => member.roles.cache.has(id));
-  }
-
-  return false;
+  return member.roles.cache.has(REVIEW_ROLE_ID);
 }
 
 function memberMentions(ids) {
@@ -345,6 +333,7 @@ async function registerCommands() {
 // ─── Ready ────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`🤖 Bot online: ${client.user.tag}`);
+  try { console.log(`📦 discord.js version: ${require('discord.js').version}`); } catch {}
   await registerCommands();
 
   for (const [label, id] of [
@@ -364,13 +353,60 @@ client.once('ready', async () => {
     const me = ch.guild?.members?.me;
     const perms = me ? ch.permissionsFor(me) : null;
     if (perms && !perms.has(PermissionFlagsBits.ManageMessages) && label === 'CHANNEL_CONTRACTS') {
-      console.warn('⚠️  Bot lacks Manage Messages in the contracts channel.');
+      console.warn('⚠️  Bot lacks Manage Messages in the contracts channel — cannot delete user screenshots. Re-run /setup-channels or grant the permission.');
     }
   }
 });
 
-// ─── Screenshot is received privately inside a Discord modal ─────────
-// No screenshot message is ever sent to #📋・контракти.
+// ─── Message listener — catches screenshot ─────────────────────────
+// The user sends one screenshot in #📋・контракти. The bot downloads it,
+// deletes the original message and then keeps the image only inside the form/embed.
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+
+  const state = formState.get(message.author.id);
+  if (!state || state.step !== 'screenshot') return;
+  if (CHANNEL_CONTRACTS && message.channelId !== CHANNEL_CONTRACTS) return;
+
+  const image = message.attachments.find(isImageAttachment);
+  if (!image) {
+    const warn = await message.reply({
+      content: '❌ Надішли саме **зображення** (PNG/JPG/WebP), а не посилання або інший файл.',
+    }).catch(() => null);
+    if (warn) setTimeout(() => warn.delete().catch(() => {}), 8000);
+    return;
+  }
+
+  try {
+    const file = await downloadBuffer(image.url, image.name);
+    state.screenshot = file;
+    state.step = 'payout';
+    if (state.screenshotTimer) {
+      clearTimeout(state.screenshotTimer);
+      state.screenshotTimer = null;
+    }
+
+    // Remove the raw screenshot message so it is not duplicated in the channel.
+    try {
+      await message.delete();
+    } catch (err) {
+      console.warn('Could not delete user screenshot:', err.message);
+      const hint = await message.channel.send({
+        content: '⚠️ Боту потрібне право **Manage Messages**, щоб прибирати початковий скріншот.',
+      }).catch(() => null);
+      if (hint) setTimeout(() => hint.delete().catch(() => {}), 10000);
+    }
+
+    if (!state.interaction) throw new Error('Не знайдено активну взаємодію форми');
+    await showPayoutStep(state.interaction, state);
+  } catch (err) {
+    console.error('Screenshot handling error:', err);
+    await message.channel.send({
+      content: `<@${message.author.id}> ❌ Не вдалося обробити скріншот. Спробуй ще раз.`,
+      allowedMentions: { users: [message.author.id] },
+    }).catch(() => {});
+  }
+});
 
 // ─── Interaction handler ──────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
@@ -413,9 +449,6 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) {
       if (interaction.customId.startsWith('modal_reject_') || interaction.customId.startsWith('modal_reject:')) {
         return await handleRejectModal(interaction);
-      }
-      if (interaction.customId.startsWith('modal_screenshot:')) {
-        return await handleScreenshotModal(interaction);
       }
     }
   } catch (err) {
@@ -522,7 +555,7 @@ async function handleContractSelect(interaction) {
   await interaction.update({ embeds: [embed], components: [row] });
 }
 
-// ─── Step 3: Screenshot in modal ──────────────────────────────────
+// ─── Step 3: Send screenshot in chat ─────────────────────────────
 async function handleMembersSelect(interaction) {
   const state = formState.get(interaction.user.id);
   if (!(await assertOwner(interaction, state))) return;
@@ -530,51 +563,26 @@ async function handleMembersSelect(interaction) {
   const ids = [...interaction.values];
   if (!ids.includes(interaction.user.id)) ids.unshift(interaction.user.id);
   state.members = [...new Set(ids)];
+  state.step = 'screenshot';
+  state.interaction = interaction;
+  scheduleScreenshotTimeout(interaction.user.id);
 
-  const modal = new ModalBuilder()
-    .setCustomId(`modal_screenshot:${state.userId}`)
-    .setTitle('Скріншот контракту');
+  const { family, perPerson } = calcPayout(state.contract.amount, state.members.length);
 
-  const upload = new FileUploadBuilder()
-    .setCustomId('screenshot')
-    .setMinValues(1)
-    .setMaxValues(1)
-    .setRequired(true);
+  const embed = new EmbedBuilder()
+    .setTitle('📋 Новий контракт')
+    .setDescription('**Крок 3/4** — Надішли скріншот виконання\n\n📸 Прикріпи **одне зображення** наступним повідомленням у цей канал. Бот збереже його у формі та одразу видалить початкове повідомлення зі скріном.')
+    .addFields(
+      { name: '🎯 Контракт', value: state.contract.name, inline: true },
+      { name: '💵 Сума', value: formatMoney(state.contract.amount), inline: true },
+      { name: '👥 Учасники', value: memberMentions(state.members) },
+      { name: "🏠 Сім'ї (20%+)", value: formatMoney(family), inline: true },
+      { name: '💰 Кожному учаснику', value: formatMoney(perPerson), inline: true },
+    )
+    .setColor(COLOR.gold)
+    .setFooter({ text: 'Після завантаження скріншота він залишиться тільки у формі' });
 
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(upload),
-  );
-
-  await interaction.showModal(modal);
-}
-
-// ─── Step 3 handler: modal screenshot ─────────────────────────────
-async function handleScreenshotModal(interaction) {
-  const ownerId = interaction.customId.split(':')[1];
-  if (ownerId && ownerId !== interaction.user.id) {
-    return interaction.reply({ content: '❌ Це чужа форма.', ephemeral: true });
-  }
-
-  const state = formState.get(interaction.user.id);
-  if (!(await assertOwner(interaction, state))) return;
-
-  const files = interaction.fields.getUploadedFiles('screenshot');
-  const uploaded = files?.first?.();
-  if (!uploaded || !isImageAttachment(uploaded)) {
-    return interaction.reply({ content: '❌ Потрібен саме скріншот-зображення.', ephemeral: true });
-  }
-
-  await interaction.deferReply({ ephemeral: true });
-  try {
-    const file = await downloadBuffer(uploaded.url, uploaded.name || 'screenshot.png');
-    state.screenshot = file;
-    state.step = 'payout';
-    state.interaction = interaction;
-    await showPayoutStep(interaction, state);
-  } catch (err) {
-    console.error('Screenshot modal error:', err);
-    await interaction.editReply({ content: '❌ Не вдалося обробити скріншот. Спробуй ще раз.' });
-  }
+  await interaction.update({ embeds: [embed], components: [] });
 }
 
 // ─── Step 4: Payout choice (called after image received) ──────────
@@ -603,6 +611,10 @@ async function showPayoutStep(interaction, state) {
     )
     .setColor(COLOR.ink)
     .setFooter({ text: 'Kaneko Family' });
+
+  if (state.screenshot) {
+    embed.setImage(`attachment://${state.screenshot.name}`);
+  }
 
   const files = state.screenshot
     ? [new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name })]
@@ -649,6 +661,7 @@ async function handlePayoutSelect(interaction) {
 
   const files = [];
   if (state.screenshot) {
+    embed.setImage(`attachment://${state.screenshot.name}`);
     files.push(new AttachmentBuilder(state.screenshot.buffer, { name: state.screenshot.name }));
   }
 
@@ -697,6 +710,8 @@ async function handleFinalSubmit(interaction) {
     )
     .setColor(COLOR.gold)
     .setFooter({ text: `Kaneko Family • ${code} • ${interaction.user.id}` });
+
+  if (state.screenshot) reviewEmbed.setImage(`attachment://${state.screenshot.name}`);
 
   const approveRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -764,6 +779,7 @@ async function handleFinalSubmit(interaction) {
     .setColor(COLOR.ok)
     .setFooter({ text: `Kaneko Family • ${code}` });
 
+  if (state.screenshot) confirmEmbed.setImage(`attachment://${state.screenshot.name}`);
 
   const newContractRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -830,6 +846,8 @@ async function handleApprove(interaction) {
       .addFields(payoutFields)
       .setColor(COLOR.ok)
       .setFooter({ text: `Kaneko Family • ${submission.code}` });
+    if (imageFiles[0]) approvedEmbed.setImage(`attachment://${imageFiles[0].name}`);
+
     const payoutsChannel = await getTextChannel(interaction.guild, CHANNEL_PAYOUTS);
     if (!payoutsChannel) throw new Error('Канал виплат не знайдено. Перевір CHANNEL_PAYOUTS.');
 
@@ -870,6 +888,9 @@ async function handleApprove(interaction) {
       .addFields(plainFields(originalEmbed.fields))
       .setColor(COLOR.ok)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${submission.code}` });
+    if (originalEmbed.image?.url) updatedEmbed.setImage(originalEmbed.image.url);
+    else if (imageFiles[0]) updatedEmbed.setImage(`attachment://${imageFiles[0].name}`);
+
     await interaction.message.edit({ embeds: [updatedEmbed], components: [] });
   } catch (err) {
     console.error('Approve error:', err);
@@ -964,6 +985,8 @@ async function handleRejectModal(interaction) {
       .addFields(plainFields(originalEmbed.fields))
       .setColor(COLOR.bad)
       .setFooter({ text: originalEmbed.footer?.text ?? `Kaneko Family • ${code}` });
+
+    if (originalEmbed.image?.url) rejectedEmbed.setImage(originalEmbed.image.url);
 
     await interaction.message.edit({ embeds: [rejectedEmbed], components: [] });
 
@@ -1097,7 +1120,7 @@ async function handleSetupChannels(interaction) {
   }
 
   await interaction.editReply({
-    content: `✅ **Канали готові!**\n\n${created.join('\n')}\n\n📌 Скопіюй ID у змінні середовища:\n\`\`\`\nCHANNEL_CONTRACTS=${ids.CHANNEL_CONTRACTS}\nCHANNEL_REVIEW=${ids.CHANNEL_REVIEW}\nCHANNEL_PAYOUTS=${ids.CHANNEL_PAYOUTS}\n\`\`\`\n\nБот налаштований для роботи з формами та контрактами.`,
+    content: `✅ **Канали готові!**\n\n${created.join('\n')}\n\n📌 Скопіюй ID у змінні середовища:\n\`\`\`\nCHANNEL_CONTRACTS=${ids.CHANNEL_CONTRACTS}\nCHANNEL_REVIEW=${ids.CHANNEL_REVIEW}\nCHANNEL_PAYOUTS=${ids.CHANNEL_PAYOUTS}\n\`\`\`\n\nБот отримав право **Manage Messages**, щоб видаляти скріни з чату.`,
   });
 }
 
@@ -1114,7 +1137,7 @@ async function handleSetupPanel(interaction) {
 
   const embed = new EmbedBuilder()
     .setTitle('Kaneko Family · Контракти')
-    .setDescription('Натисни кнопку, щоб подати виконаний контракт.\nСкріншот додається приватно у форму та не публікується окремим повідомленням.')
+    .setDescription('Натисни кнопку, щоб подати виконаний контракт.\nСкріншот з чату забере бот, форма залишиться як квитанція з номером.')
     .addFields(
       { name: 'Наступний номер', value: `\`${next}\``, inline: true },
       { name: 'Типів контрактів', value: String(CONTRACTS.length), inline: true },
